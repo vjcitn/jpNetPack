@@ -1,0 +1,201 @@
+---
+title: "jpNetPack: infrastructure for genomics network research"
+author: "Vincent J. Carey, stvjc at channing.harvard.edu"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+vignette: >
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteIndexEntry{"jpNetPack: infrastructure for genomics network research"}
+  %\VignetteEncoding{UTF-8}
+output:
+  BiocStyle::html_document:
+    highlight: pygments
+    number_sections: yes
+    theme: united
+    toc: yes
+---
+
+```{r setup,echo=FALSE,results="hide"}
+suppressPackageStartupMessages({
+library(jpNetPack)
+library(DT)
+library(mongolite)
+})
+```
+
+# Introduction
+
+This package demonstrates high-level tasks related to research in genomic regulatory networks that we can perform with Bioconductor packages.
+
+# Basic representations: eQTL, TF, and chromatin accessibility assay resources
+
+We use `GRanges` instances to represent variants and genomic regions of interest.
+
+## eQTL from GTEx
+
+```{r doeq}
+suppressMessages({
+library(jpNetPack)
+library(TxRegInfra)
+library(GenomeInfoDb)
+library(TFutils)
+library(knitr)
+library(DT)
+library(mongolite)
+})
+head(demo_eQTL_granges, 3)
+```
+
+## TFBS via FIMO
+
+The FIMO runs from Kimbie Glass and Abhijeet Sonawane can 
+be imported as GRanges, via a GenomicFiles object. In 
+this example, binding affinities of VDR and POU2F1 are 
+tabulated in a small region of chr17.
+
+```{r lkfim}
+lapply(demo_fimo_granges, lapply, head, 3)
+```
+
+## DnaseI hotspots and digital genomic footprints
+
+```{r lklk}
+head(sbov_output_HS,3)
+head(sbov_output_FP,3)
+```
+
+## Finding intersections
+
+In this example, we search TFs for binding sites that overlap with eQTL.
+
+```{r lklklk}
+seqlevelsStyle(demo_eQTL_granges) = "UCSC"
+lapply(demo_fimo_granges, lapply, function(x) subsetByOverlaps(x, demo_eQTL_granges))
+```
+
+In the other direction, we enumerate eQTL assertions that overlap with TFBS:
+
+```{r ajdja}
+lapply(demo_fimo_granges, lapply, 
+   function(x) subsetByOverlaps(demo_eQTL_granges, x))
+```
+
+This shows that two SNPs that have association with 
+expression of multiple genes overlap with binding sites asserted 
+for POU2F1, but not for any with VDR.
+
+
+# Extensions Part 1: Querying AWS for eQTL information
+
+## Sample annotation
+
+```{r gettab}
+data(basicColData)
+as.data.frame(basicColData) %>% dplyr::filter(type=="eQTL") %>% datatable
+```
+
+## Database connection
+
+We use mongolite to provide access to a specific tissue type for which GTEx eQTL are available.
+
+```{r domon}
+con1 = mongo(url=URL_txregInAWS(), db="txregnet", 
+   collection="Adipose_Subcutaneous_allpairs_v7_eQTL")
+con1$find(limit=1)
+```
+
+## Wrapping the connection with annotation
+
+This interface can be wrapped to simplify access to
+various tissue/assay types.
+
+```{r doobj}
+cd = TxRegInfra::basicColData
+rme0 = RaggedMongoExpt(con1, colData=cd)
+alleq = rme0[, which(colData(rme0)$type=="eQTL")]
+eq2 = alleq[, which(colData(alleq)$base == "Adipose")]
+eq2
+```
+
+## Querying mongodb
+
+We can use `sbov` to look for overlaps between the eQTLs
+and ranges of interest.  At present we do one tissue at
+a time.  We need to make our queries with sturdy and self-describing
+GRanges.  Here we are interested in eQTL lying on chr17 between
+positions 38000000 and 38100000.
+
+```{r lksb}
+query = GRanges("17", IRanges(38e6, 38.1e6))
+si = GenomeInfoDb::Seqinfo(genome="hg19")["chr17"]
+seqlevelsStyle(si) = "NCBI"
+seqinfo(query) = si
+BiocParallel::register(BiocParallel::SerialParam())
+chksub = sbov(eq2[,"Adipose_Subcutaneous_allpairs_v7_eQTL"], query)
+chkoment = sbov(eq2[,"Adipose_Visceral_Omentum_allpairs_v7_eQTL"], query)
+```
+
+## Downstream work
+
+Are there eQTL shared between subcutaneous adipose and visceral omentum
+samples in the query region?
+
+```{r lklklklklk}
+fo = findOverlaps(chksub, chkoment)
+fo
+```
+
+Many are shared.
+
+# Extensions Part 2: Querying AWS for TF information
+
+We don't use mongoDB for TF data -- the FIMO data are
+too voluminous.  In the cloud we have a small number of
+FIMO runs.  They have 'bed' in their names, but they
+are not really BED format.
+
+```{r lkfim2}
+library(TFutils)
+colnames(fimo16) = fimo16$HGNC
+fimo16
+psfimo = fimo16[,c("POU2F1", "STAT1")]
+colnames(psfimo)
+```
+
+To find predicted binding regions and scores in an interval
+of interest, use
+```{r lklkfi}
+seqlevelsStyle(query) = "UCSC" # switch back
+pslook = fimo_granges( psfimo, query )
+pslook
+```
+
+# Extensions part 3.  Building graphs for eQTL-TFBS intersections
+
+We need to tack gene symbols on to our eQTL reports.
+```{r dosy}
+addsyms = function(x, EnsDb=EnsDb.Hsapiens.v75::EnsDb.Hsapiens.v75) {
+  ensids = gsub("\\..*", "", x$gene_id) # remove post period
+  gns = ensembldb::genes(EnsDb)
+  x$symbol = gns[ensids]$symbol
+  x
+}
+sbov_output_eQTL = addsyms(sbov_output_eQTL)
+seqlevelsStyle(sbov_output_eQTL) = "UCSC"
+```
+
+Now we can obtain the intersections of our eQTL with
+binding sites for the two TFs inspected above:
+```{r nnn}
+ints = lapply(pslook, lapply, function(x) 
+  subsetByOverlaps(sbov_output_eQTL, x))
+```
+and convert these to graphNEL instances:
+```{r ggg}
+ll = lapply(ints, lapply, function(x) sbov_to_graphNEL(x))
+```
+then to igraph:
+```{r vis}
+library(igraph)
+stat1 = igraph.from.graphNEL(ll$STAT1[[1]])
+plot(stat1, main="SNP:Gene assoc in GTEx lung within STAT1 binding sites by FIMO")
+```
